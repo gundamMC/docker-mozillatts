@@ -1,2 +1,2 @@
 docker:
-	docker build . -t synesthesiam/mozillatts
+	docker build . -t gundamMC/mozillatts

@@ -7,41 +7,48 @@ from pathlib import Path
 import torch
 from flask import Flask, Response, render_template, request
 from flask_cors import CORS
-from TTS.utils.generic_utils import setup_model
+from TTS.tf.utils.tflite import load_tflite_model
+from TTS.tf.utils.io import load_checkpoint
 from TTS.utils.io import load_config
 from TTS.utils.text.symbols import symbols, phonemes
 from TTS.utils.audio import AudioProcessor
 from TTS.utils.synthesis import synthesis
-from TTS.vocoder.utils.generic_utils import setup_generator
 
 _DIR = Path(__file__).parent
 
 # -----------------------------------------------------------------------------
 
 
-def tts(model, text, CONFIG, use_cuda: bool, ap, use_gl: bool):
-    waveform, alignment, mel_spec, mel_postnet_spec, stop_tokens, inputs = synthesis(
-        model,
-        text,
-        CONFIG,
-        use_cuda,
-        ap,
-        speaker_id,
-        style_wav=None,
-        truncated=False,
-        enable_eos_bos_chars=CONFIG.enable_eos_bos_chars,
-    )
-    # mel_postnet_spec = ap._denormalize(mel_postnet_spec.T)
-    if not use_gl:
-        waveform = vocoder_model.inference(
-            torch.FloatTensor(mel_postnet_spec.T).unsqueeze(0)
-        )
-        waveform = waveform.flatten()
-    if use_cuda:
-        waveform = waveform.cpu()
+def run_vocoder(mel_spec):
+  vocoder_inputs = mel_spec[None, :, :]
+  # get input and output details
+  input_details = vocoder_model.get_input_details()
+  # reshape input tensor for the new input shape
+  vocoder_model.resize_tensor_input(input_details[0]['index'], vocoder_inputs.shape)
+  vocoder_model.allocate_tensors()
+  detail = input_details[0]
+  vocoder_model.set_tensor(detail['index'], vocoder_inputs)
+  # run the model
+  vocoder_model.invoke()
+  # collect outputs
+  output_details = vocoder_model.get_output_details()
+  waveform = vocoder_model.get_tensor(output_details[0]['index'])
+  return waveform 
 
-    waveform = waveform.numpy()
 
+def tts(model, text, CONFIG, p):
+    t_1 = time.time()
+    waveform, alignment, mel_spec, mel_postnet_spec, stop_tokens, inputs = synthesis(model, text, CONFIG, use_cuda, ap, speaker_id, style_wav=None,
+                                                                             truncated=False, enable_eos_bos_chars=CONFIG.enable_eos_bos_chars,
+                                                                             backend='tflite')
+    waveform = run_vocoder(mel_postnet_spec.T)
+    waveform = waveform[0, 0]
+    rtf = (time.time() - t_1) / (len(waveform) / ap.sample_rate)
+    tps = (time.time() - t_1) / len(waveform)
+    print(waveform.shape)
+    print(" > Run-time: {}".format(time.time() - t_1))
+    print(" > Real-time factor: {}".format(rtf))
+    print(" > Time per step: {}".format(tps))
     return alignment, mel_postnet_spec, stop_tokens, waveform
 
 
@@ -51,10 +58,10 @@ def tts(model, text, CONFIG, use_cuda: bool, ap, use_gl: bool):
 use_cuda = False
 
 # model paths
-TTS_MODEL = _DIR / "model" / "checkpoint_130000.pth.tar"
-TTS_CONFIG = _DIR / "model" / "config.json"
-VOCODER_MODEL = _DIR / "vocoder" / "checkpoint_1450000.pth.tar"
-VOCODER_CONFIG = _DIR / "vocoder" / "config.json"
+TTS_MODEL = str(_DIR / "model" / "tts_model.tflite")
+TTS_CONFIG = str(_DIR / "model" / "config.json")
+VOCODER_MODEL = str(_DIR / "vocoder" / "vocoder_model.tflite")
+VOCODER_CONFIG = str(_DIR / "vocoder" / "config_vocoder.json")
 
 # load configs
 TTS_CONFIG = load_config(TTS_CONFIG)
@@ -69,34 +76,8 @@ speaker_id = None
 speakers = []
 
 # load the model
-num_chars = len(phonemes) if TTS_CONFIG.use_phonemes else len(symbols)
-model = setup_model(num_chars, len(speakers), TTS_CONFIG)
-
-# load model state
-cp = torch.load(TTS_MODEL, map_location=torch.device("cpu"))
-
-# load the model
-model.load_state_dict(cp["model"])
-if use_cuda:
-    model.cuda()
-
-model.eval()
-
-# set model stepsize
-if "r" in cp:
-    model.decoder.set_r(cp["r"])
-
-# LOAD VOCODER MODEL
-vocoder_model = setup_generator(VOCODER_CONFIG)
-vocoder_model.load_state_dict(torch.load(VOCODER_MODEL, map_location="cpu")["model"])
-vocoder_model.remove_weight_norm()
-vocoder_model.inference_padding = 0
-
-ap_vocoder = AudioProcessor(**VOCODER_CONFIG["audio"])
-if use_cuda:
-    vocoder_model.cuda()
-
-vocoder_model.eval()
+model = load_tflite_model(TTS_MODEL)
+vocoder_model = load_tflite_model(VOCODER_MODEL)
 
 # -----------------------------------------------------------------------------
 
@@ -109,9 +90,7 @@ CORS(app)
 @app.route("/api/tts")
 def api_tts():
     text = request.args.get("text", "").strip()
-    align, spec, stop_tokens, wav = tts(
-        model, text, TTS_CONFIG, use_cuda, ap, use_gl=False
-    )
+    align, spec, stop_tokens, wav = tts(model, text, TTS_CONFIG, ap)
 
     with io.BytesIO() as out:
         ap.save_wav(wav, out)
